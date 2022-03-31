@@ -1,0 +1,1113 @@
+import imutils
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QRegExp, Qt
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QTextCursor, QRegExpValidator
+from PyQt5.QtWidgets import *
+from PyQt5.uic import loadUi
+import logging
+import logging.config
+import sqlite3
+import sys
+import threading
+import queue
+import multiprocessing
+
+from datetime import datetime
+import dlib
+import datetime
+import argparse
+
+from scipy.spatial import distance as dist
+from imutils import face_utils
+import numpy as np  # 数据处理的库 numpy
+import os
+import cv2
+import math
+import winsound
+from tensorflow.python.keras.models import load_model
+from keras.preprocessing import image
+import time
+
+my_model = load_model('./my_model.h5')
+#from Core import Ui_CoreUI
+
+
+
+# 找不到已训练的人脸数据文件
+class TrainingDataNotFound(FileNotFoundError):
+    pass
+
+# 找不到数据库文件
+class DatabaseNotFound(FileNotFoundError):
+    pass
+
+class mywindow1(QWidget):
+    def __init__(self):
+        super(mywindow1,self).__init__()
+        #self.__init__()
+        #self.ui=DataRecordUI()
+        #self.ui.__init__()
+        loadUi('./ui/DataRecord.ui', self)
+
+    def open(self):
+        self.show()
+
+class CoreUI(QMainWindow):
+    database = './FaceBase.db'
+    trainingData = './recognizer/trainingData.yml'
+    cap = cv2.VideoCapture()
+    captureQueue = queue.Queue()  # 图像队列
+    alarmQueue = queue.LifoQueue()  # 报警队列，后进先出
+    logQueue = multiprocessing.Queue()  # 日志队列
+    receiveLogSignal = pyqtSignal(str)  # LOG信号
+
+    def __init__(self):
+
+        super(CoreUI, self).__init__()
+
+
+        loadUi('./ui/Core.ui', self)
+        self.setWindowIcon(QIcon('./icons/icon.png'))
+        #self.setFixedSize(1161, 620)
+
+
+        # 图像捕获
+        self.isExternalCameraUsed = False
+        self.useExternalCameraCheckBox.stateChanged.connect(
+            lambda: self.useExternalCamera(self.useExternalCameraCheckBox) )
+        self.faceProcessingThread = FaceProcessingThread()
+        self.startWebcamButton.clicked.connect(self.startWebcam)
+
+        #A\B功能开关
+
+        # 数据库
+        # self.initDbButton.setIcon(QIcon('./icons/warning.png'))
+        self.initDbButton.clicked.connect(self.initDb)
+
+        self.timer = QTimer(self)  # 初始化一个定时器
+        self.timer.timeout.connect(self.updateFrame)
+
+        # 功能开关
+        self.faceTrackerCheckBox.stateChanged.connect(
+            lambda: self.faceProcessingThread.enableFaceTracker(self))
+        self.faceRecognizerCheckBox.stateChanged.connect(
+            lambda: self.faceProcessingThread.enableFaceRecognizer(self))
+        self.panalarmCheckBox.stateChanged.connect(lambda: self.faceProcessingThread.enablePanalarm(self))
+
+        # 直方图均衡化
+        self.equalizeHistCheckBox.stateChanged.connect(
+            lambda: self.faceProcessingThread.enableEqualizeHist(self))
+
+        # 调试模式
+        self.debugCheckBox.stateChanged.connect(lambda: self.faceProcessingThread.enableDebug(self))
+        self.confidenceThresholdSlider.valueChanged.connect(
+            lambda: self.faceProcessingThread.setConfidenceThreshold(self))
+        self.confidenceThresholdSlider.valueChanged.connect(
+            lambda: self.confidenceThresholdWidget.setPowerLevel(self.confidenceThresholdSlider.value() ))
+        self.autoAlarmThresholdSlider.valueChanged.connect(
+            lambda: self.faceProcessingThread.setAutoAlarmThreshold(self))
+        self.autoAlarmThresholdSlider.valueChanged.connect(
+            lambda: self.autoAlarmThresholdWidget.setPowerLevel(self.autoAlarmThresholdSlider.value()))
+
+        # 报警系统
+        self.alarmSignalThreshold = 10
+        #self.panalarmThread = threading.Thread(target=self.recieveAlarm, daemon=True)
+        self.isBellEnabled = True
+        #self.bellCheckBox.stateChanged.connect(lambda: self.enableBell(self.bellCheckBox))
+        self.isTelegramBotPushEnabled = False
+        #self.telegramBotPushCheckBox.stateChanged.connect(
+            #lambda: self.enableTelegramBotPush(self.telegramBotPushCheckBox))
+
+        # 日志系统
+        self.receiveLogSignal.connect(lambda log: self.logOutput(log))
+        self.logOutputThread = threading.Thread(target=self.receiveLog, daemon=True)
+        self.logOutputThread.start()
+
+    # 检查数据库状态
+    def initDb(self):
+        try:
+            if not os.path.isfile(self.database):
+                raise DatabaseNotFound
+            if not os.path.isfile(self.trainingData):
+                raise TrainingDataNotFound
+
+            conn = sqlite3.connect(self.database)
+            cursor = conn.cursor()
+            cursor.execute('SELECT Count(*) FROM users')
+            result = cursor.fetchone()
+            dbUserCount = result[0]
+        except DatabaseNotFound:
+            logging.error('系统找不到数据库文件{}'.format(self.database))
+            # self.initDbButton.setIcon(QIcon('./icons/error.png'))
+            self.logQueue.put('Error：未发现数据库文件，你可能未进行人脸采集')
+        except TrainingDataNotFound:
+            logging.error('系统找不到已训练的人脸数据{}'.format(self.trainingData))
+            # self.initDbButton.setIcon(QIcon('./icons/error.png'))
+            self.logQueue.put('Error：未发现已训练的人脸数据文件，请完成训练后继续')
+        except Exception as e:
+            logging.error('读取数据库异常，无法完成数据库初始化')
+            # self.initDbButton.setIcon(QIcon('./icons/error.png'))
+            self.logQueue.put('Error：读取数据库异常，初始化数据库失败')
+        else:
+            cursor.close()
+            conn.close()
+            if not dbUserCount > 0:
+                logging.warning('数据库为空')
+                self.logQueue.put('warning：数据库为空，人脸识别功能不可用')
+                # self.initDbButton.setIcon(QIcon('./icons/warning.png'))
+            else:
+                self.logQueue.put('数据库状态正常，发现用户数：{}'.format(dbUserCount))
+                # self.initDbButton.setIcon(QIcon('./icons/success.png'))
+                self.initDbButton.setEnabled(False)
+                self.faceRecognizerCheckBox.setToolTip('须先开启人脸跟踪')
+                self.faceRecognizerCheckBox.setEnabled(True)
+
+    # 是否使用外接摄像头
+    def useExternalCamera(self, useExternalCameraCheckBox):
+        if useExternalCameraCheckBox.isChecked():
+            self.isExternalCameraUsed = True
+        else:
+            self.isExternalCameraUsed = False
+
+    # 打开/关闭摄像头
+    def startWebcam(self):
+        if not self.cap.isOpened():
+            if self.isExternalCameraUsed:
+                camID = 1
+            else:
+                camID = 0
+            self.cap.open(camID)#在这里改！  可以改成路径的
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.error('无法调用电脑摄像头{}'.format(camID))
+                self.logQueue.put('Error：初始化摄像头失败')
+                self.cap.release()
+                self.startWebcamButton.setIcon(QIcon('./icons/error.png'))
+            else:
+                self.faceProcessingThread.start()  # 启动OpenCV图像处理线程
+                self.timer.start(5)  # 启动定时器
+                #self.panalarmThread.start()  # 启动报警系统线程
+                self.startWebcamButton.setIcon(QIcon('./icons/success.png'))
+                self.startWebcamButton.setText('关闭摄像头')
+
+        else:
+            text = '如果关闭摄像头，须重启程序才能再次打开。'
+            informativeText = '<b>是否继续？</b>'
+            ret = CoreUI.callDialog(QMessageBox.Warning, text, informativeText, QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No)
+
+            if ret == QMessageBox.Yes:
+                self.faceProcessingThread.stop()
+                if self.cap.isOpened():
+                    if self.timer.isActive():
+                        self.timer.stop()
+                    self.cap.release()
+
+                self.realTimeCaptureLabel.clear()
+                self.realTimeCaptureLabel.setText('<font color=red>摄像头未开启</font>')
+                self.startWebcamButton.setText('摄像头已关闭')
+                self.startWebcamButton.setEnabled(False)
+                self.startWebcamButton.setIcon(QIcon())
+
+    # 定时器，实时更新画面
+    def updateFrame(self):
+        if self.cap.isOpened():
+            # ret, frame = self.cap.read()
+            # if ret:
+            #     self.showImg(frame, self.realTimeCaptureLabel)
+            if not self.captureQueue.empty():
+                captureData = self.captureQueue.get()
+                realTimeFrame = captureData.get('realTimeFrame')
+                self.displayImage(realTimeFrame, self.realTimeCaptureLabel)
+
+    # 显示图片
+    def displayImage(self, img, qlabel):
+        # BGR -> RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # default：The image is stored using 8-bit indexes into a colormap， for example：a gray image
+        qformat = QImage.Format_Indexed8
+
+        if len(img.shape) == 3:  # rows[0], cols[1], channels[2]
+            if img.shape[2] == 4:
+                # The image is stored using a 32-bit byte-ordered RGBA format (8-8-8-8)
+                # A: alpha channel，不透明度参数。如果一个像素的alpha通道数值为0%，那它就是完全透明的
+                qformat = QImage.Format_RGBA8888
+            else:
+                qformat = QImage.Format_RGB888
+
+        # img.shape[1]：图像宽度width，img.shape[0]：图像高度height，img.shape[2]：图像通道数
+        # QImage.__init__ (self, bytes data, int width, int height, int bytesPerLine, Format format)
+        # 从内存缓冲流获取img数据构造QImage类
+        # img.strides[0]：每行的字节数（width*3）,rgb为3，rgba为4
+        # strides[0]为最外层(即一个二维数组所占的字节长度)，strides[1]为次外层（即一维数组所占字节长度），strides[2]为最内层（即一个元素所占字节长度）
+        # 从里往外看，strides[2]为1个字节长度（uint8），strides[1]为3*1个字节长度（3即rgb 3个通道）
+        # strides[0]为width*3个字节长度，width代表一行有几个像素
+
+        outImage = QImage(img, img.shape[1], img.shape[0], img.strides[0], qformat)
+        qlabel.setPixmap(QPixmap.fromImage(outImage))
+        qlabel.setScaledContents(True)  # 图片自适应大小
+
+    # 报警系统：是否允许设备响铃
+    def enableBell(self, bellCheckBox):
+        if bellCheckBox.isChecked():
+            self.isBellEnabled = True
+            self.statusBar().showMessage('设备发声：开启')
+        else:
+
+            self.isBellEnabled = False
+            self.statusBar().showMessage('设备发声：关闭')
+            '''else:
+                self.logQueue.put('Error：操作失败，至少选择一种报警方式')
+                self.bellCheckBox.setCheckState(Qt.Unchecked)
+                self.bellCheckBox.setChecked(True)'''
+        # print('isBellEnabled：', self.isBellEnabled)
+
+    # 设备响铃进程
+    def bellProcess(queue):
+        logQueue = queue
+        logQueue.put('Info：设备正在响铃...')
+        winsound.PlaySound('./alarm.wav', winsound.SND_FILENAME)
+
+    # 系统日志服务常驻，接收并处理系统日志
+    def receiveLog(self):
+        while True:
+            data = self.logQueue.get()
+            if data:
+                self.receiveLogSignal.emit(data)
+            else:
+                continue
+
+    # LOG输出
+    def logOutput(self, log):
+        # 获取当前系统时间
+        time = datetime.datetime.now().strftime('[%Y/%m/%d %H:%M:%S]')
+        log = time + ' ' + log + '\n'
+
+        self.logTextEdit.moveCursor(QTextCursor.End)
+        self.logTextEdit.insertPlainText(log)
+        self.logTextEdit.ensureCursorVisible()  # 自动滚屏
+
+    # 系统对话框
+    def callDialog(icon, text, informativeText, standardButtons, defaultButton=None):
+        msg = QMessageBox()
+        msg.setWindowIcon(QIcon('./icons/icon.png'))
+        msg.setWindowTitle('OpenCV Face Recognition System - Core')
+        msg.setIcon(icon)
+        msg.setText(text)
+        msg.setInformativeText(informativeText)
+        msg.setStandardButtons(standardButtons)
+        if defaultButton:
+            msg.setDefaultButton(defaultButton)
+        return msg.exec()
+
+    # 窗口关闭事件，关闭OpenCV线程、定时器、摄像头
+    def closeEvent(self, event):
+        if self.faceProcessingThread.isRunning:
+            self.faceProcessingThread.stop()
+        if self.timer.isActive():
+            self.timer.stop()
+        if self.cap.isOpened():
+            self.cap.release()
+        event.accept()
+
+# OpenCV线程
+class FaceProcessingThread(QThread):
+    #logQueue = multiprocessing.Queue()
+    logQueue1 = CoreUI.logQueue
+    def __init__(self):
+        super(FaceProcessingThread, self).__init__()
+        self.isRunning = True
+
+        self.isFaceTrackerEnabled = True
+        self.isFaceRecognizerEnabled = False
+        self.isPanalarmEnabled = True
+
+        self.isDebugMode = False
+        self.confidenceThreshold = 50
+        self.autoAlarmThreshold = 65
+
+        self.isEqualizeHistEnabled = False
+
+        self.VIDEO_STREAM = 0
+        self.CAMERA_STYLE = False # False未打开摄像头，True摄像头已打开
+        # 闪烁阈值（秒）
+        self.AR_CONSEC_FRAMES_check = 3
+        self.OUT_AR_CONSEC_FRAMES_check = 5
+        # 眼睛长宽比
+        self.EYE_AR_THRESH = 0.15
+        self.EYE_AR_CONSEC_FRAMES = self.AR_CONSEC_FRAMES_check
+        # 打哈欠长宽比
+        self.MAR_THRESH = 0.6
+        self.MOUTH_AR_CONSEC_FRAMES = self.AR_CONSEC_FRAMES_check
+        # 瞌睡点头
+        self.HAR_THRESH = 15
+        self.NOD_AR_CONSEC_FRAMES = self.AR_CONSEC_FRAMES_check
+
+        """计数"""
+        # 初始化帧计数器和眨眼总数
+        self.COUNTER = 0
+        self.TOTAL = 0
+        # 初始化帧计数器和打哈欠总数
+        self.mCOUNTER = 0
+        self.mTOTAL = 0
+        # 初始化帧计数器和点头总数
+        self.hCOUNTER = 0
+        self.hTOTAL = 0
+        # 离职时间长度
+        self.oCOUNTER = 0
+        self.i=1
+        self.text1=None
+        #图片计数
+
+        """姿态"""
+        # 世界坐标系(UVW)：填写3D参考点，该模型参考http://aifi.isr.uc.pt/Downloads/OpenGL/glAnthropometric3DModel.cpp
+        self.object_pts = np.float32([[6.825897, 6.760612, 4.402142],  #33左眉左上角
+                                 [1.330353, 7.122144, 6.903745],  #29左眉右角
+                                 [-1.330353, 7.122144, 6.903745], #34右眉左角
+                                 [-6.825897, 6.760612, 4.402142], #38右眉右上角
+                                 [5.311432, 5.485328, 3.987654],  #13左眼左上角
+                                 [1.789930, 5.393625, 4.413414],  #17左眼右上角
+                                 [-1.789930, 5.393625, 4.413414], #25右眼左上角
+                                 [-5.311432, 5.485328, 3.987654], #21右眼右上角
+                                 [2.005628, 1.409845, 6.165652],  #55鼻子左上角
+                                 [-2.005628, 1.409845, 6.165652], #49鼻子右上角
+                                 [2.774015, -2.080775, 5.048531], #43嘴左上角
+                                 [-2.774015, -2.080775, 5.048531],#39嘴右上角
+                                 [0.000000, -3.116408, 6.097667], #45嘴中央下角
+                                 [0.000000, -7.415691, 4.070434]])#6下巴角
+
+        # 相机坐标系(XYZ)：添加相机内参
+        self.K = [6.5308391993466671e+002, 0.0, 3.1950000000000000e+002,
+                 0.0, 6.5308391993466671e+002, 2.3950000000000000e+002,
+                 0.0, 0.0, 1.0]# 等价于矩阵[fx, 0, cx; 0, fy, cy; 0, 0, 1]
+        # 图像中心坐标系(uv)：相机畸变参数[k1, k2, p1, p2, k3]
+        self.D = [7.0834633684407095e-002, 6.9140193737175351e-002, 0.0, 0.0, -1.3073460323689292e+000]
+
+        # 像素坐标系(xy)：填写凸轮的本征和畸变系数
+        self.cam_matrix = np.array(self.K).reshape(3, 3).astype(np.float32)
+        self.dist_coeffs = np.array(self.D).reshape(5, 1).astype(np.float32)
+
+        # 重新投影3D点的世界坐标轴以验证结果姿势
+        self.reprojectsrc = np.float32([[10.0, 10.0, 10.0],
+                                       [10.0, 10.0, -10.0],
+                                       [10.0, -10.0, -10.0],
+                                       [10.0, -10.0, 10.0],
+                                       [-10.0, 10.0, 10.0],
+                                       [-10.0, 10.0, -10.0],
+                                       [-10.0, -10.0, -10.0],
+                                       [-10.0, -10.0, 10.0]])
+        # 绘制正方体12轴
+        self.line_pairs = [[0, 1], [1, 2], [2, 3], [3, 0],
+                          [4, 5], [5, 6], [6, 7], [7, 4],
+                          [0, 4], [1, 5], [2, 6], [3, 7]]
+
+    # 是否开启人脸跟踪
+    def enableFaceTracker(self, coreUI):
+        if coreUI.faceTrackerCheckBox.isChecked():
+            self.isFaceTrackerEnabled = True
+            coreUI.statusBar().showMessage('人脸跟踪：开启')
+        else:
+            self.isFaceTrackerEnabled = False
+            coreUI.statusBar().showMessage('人脸跟踪：关闭')
+
+    # 是否开启人脸识别
+    def enableFaceRecognizer(self, coreUI):
+        if coreUI.faceRecognizerCheckBox.isChecked():
+            if self.isFaceTrackerEnabled:
+                self.isFaceRecognizerEnabled = True
+                coreUI.statusBar().showMessage('人脸识别：开启')
+            else:
+                CoreUI.logQueue.put('Error：操作失败，请先开启人脸跟踪')
+                coreUI.faceRecognizerCheckBox.setCheckState(Qt.Unchecked)
+                coreUI.faceRecognizerCheckBox.setChecked(False)
+        else:
+            self.isFaceRecognizerEnabled = False
+            coreUI.statusBar().showMessage('人脸识别：关闭')
+
+    # 是否开启报警系统
+    def enablePanalarm(self, coreUI):
+        if coreUI.panalarmCheckBox.isChecked():
+            self.isPanalarmEnabled = True
+            coreUI.statusBar().showMessage('报警系统：开启')
+        else:
+            self.isPanalarmEnabled = False
+            coreUI.statusBar().showMessage('报警系统：关闭')
+
+    # 是否开启调试模式
+    def enableDebug(self, coreUI):
+        if coreUI.debugCheckBox.isChecked():
+            self.isDebugMode = True
+            coreUI.statusBar().showMessage('调试模式：开启')
+        else:
+            self.isDebugMode = False
+            coreUI.statusBar().showMessage('调试模式：关闭')
+
+    # 设置置信度阈值
+    def setConfidenceThreshold(self, coreUI):
+        if self.isDebugMode:
+            self.confidenceThreshold = coreUI.confidenceThresholdSlider.value()
+            coreUI.statusBar().showMessage('置信度阈值：{}'.format(self.confidenceThreshold))
+
+    # 设置自动报警阈值
+    def setAutoAlarmThreshold(self, coreUI):
+        if self.isDebugMode:
+            self.autoAlarmThreshold = coreUI.autoAlarmThresholdSlider.value()
+            coreUI.statusBar().showMessage('自动报警阈值：{}'.format(self.autoAlarmThreshold))
+
+    # 直方图均衡化
+    def enableEqualizeHist(self, coreUI):
+        if coreUI.equalizeHistCheckBox.isChecked():
+            self.isEqualizeHistEnabled = True
+            coreUI.statusBar().showMessage('直方图均衡化：开启')
+        else:
+            self.isEqualizeHistEnabled = False
+            coreUI.statusBar().showMessage('直方图均衡化：关闭')
+
+    def get_head_pose(self,shape):# 头部姿态估计
+        # （像素坐标集合）填写2D参考点，注释遵循https://ibug.doc.ic.ac.uk/resources/300-W/
+        # 17左眉左上角/21左眉右角/22右眉左上角/26右眉右上角/36左眼左上角/39左眼右上角/42右眼左上角/
+        # 45右眼右上角/31鼻子左上角/35鼻子右上角/48左上角/54嘴右上角/57嘴中央下角/8下巴角
+        image_pts = np.float32([shape[17], shape[21], shape[22], shape[26], shape[36],
+                                shape[39], shape[42], shape[45], shape[31], shape[35],
+                                shape[48], shape[54], shape[57], shape[8]])
+        # solvePnP计算姿势——求解旋转和平移矩阵：
+        # rotation_vec表示旋转矩阵，translation_vec表示平移矩阵，cam_matrix与K矩阵对应，dist_coeffs与D矩阵对应。
+        _, rotation_vec, translation_vec = cv2.solvePnP(self.object_pts, image_pts, self.cam_matrix, self.dist_coeffs)
+        # projectPoints重新投影误差：原2d点和重投影2d点的距离（输入3d点、相机内参、相机畸变、r、t，输出重投影2d点）
+        reprojectdst, _ = cv2.projectPoints(self.reprojectsrc, rotation_vec, translation_vec, self.cam_matrix,self.dist_coeffs)
+        reprojectdst = tuple(map(tuple, reprojectdst.reshape(8, 2)))# 以8行2列显示
+
+        # 计算欧拉角calc euler angle
+        # 参考https://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html#decomposeprojectionmatrix
+        rotation_mat, _ = cv2.Rodrigues(rotation_vec)#罗德里格斯公式（将旋转矩阵转换为旋转向量）
+        pose_mat = cv2.hconcat((rotation_mat, translation_vec))# 水平拼接，vconcat垂直拼接
+        # decomposeProjectionMatrix将投影矩阵分解为旋转矩阵和相机矩阵
+        _, _, _, _, _, _, euler_angle = cv2.decomposeProjectionMatrix(pose_mat)
+
+        pitch, yaw, roll = [math.radians(_) for _ in euler_angle]
+
+        pitch = math.degrees(math.asin(math.sin(pitch)))
+        roll = -math.degrees(math.asin(math.sin(roll)))
+        yaw = math.degrees(math.asin(math.sin(yaw)))
+        #print('pitch:{}, yaw:{}, roll:{}'.format(pitch, yaw, roll))
+
+        return reprojectdst, euler_angle# 投影误差，欧拉角
+
+    #用于计算眼睛长宽比，获取比值
+    def eye_aspect_ratio(self,eye):
+        # 垂直眼标志（X，Y）坐标
+        A = dist.euclidean(eye[1], eye[5])# 计算两个集合之间的欧式距离
+        B = dist.euclidean(eye[2], eye[4])
+        # 计算水平之间的欧几里得距离
+        # 水平眼标志（X，Y）坐标
+        C = dist.euclidean(eye[0], eye[3])
+        # 眼睛长宽比的计算
+        ear = (A + B) / (2.0 * C)
+        # 返回眼睛的长宽比
+        return ear
+
+    def mouth_aspect_ratio(self,mouth):# 嘴部
+        A = np.linalg.norm(mouth[2] - mouth[9])  # 51, 59
+        B = np.linalg.norm(mouth[4] - mouth[7])  # 53, 57
+        C = np.linalg.norm(mouth[0] - mouth[6])  # 49, 55
+        mar = (A + B) / (2.0 * C)
+        return mar
+
+
+
+
+    def nose_jaw_distance(self, nose, jaw):
+        # 计算鼻子上一点"27"到左右脸边界的欧式距离
+        face_left1 = dist.euclidean(nose[0], jaw[0])  # 27, 0
+        face_right1 = dist.euclidean(nose[0], jaw[16])  # 27, 16
+        # 计算鼻子上一点"30"到左右脸边界的欧式距离
+        face_left2 = dist.euclidean(nose[3], jaw[2])  # 30, 2
+        face_right2 = dist.euclidean(nose[3], jaw[14])  # 30, 14
+        # 创建元组，用以保存4个欧式距离值
+        face_distance = (face_left1, face_right1, face_left2, face_right2)
+
+        return face_distance
+
+
+
+
+    '''def paint_chinese_opencv(self, chinese, position, fontsize, color):  # opencv输出中文
+        img_PIL = Image.fromarray(cv2.cvtColor(self, cv2.COLOR_BGR2RGB))  # 图像从OpenCV格式转换成PIL格式
+        font = ImageFont.truetype('simhei.ttf', fontsize, encoding="utf-8")
+        color = (255,0,0) # 字体颜色
+        position = (100,100)# 文字输出位置
+        draw = ImageDraw.Draw(img_PIL)
+        draw.text(position, chinese, font=font, fill=color)  # PIL图片上打印汉字 # 参数1：打印坐标，参数2：文本，参数3：字体颜色，参数4：字体
+        img = cv2.cvtColor(np.asarray(img_PIL), cv2.COLOR_RGB2BGR)  # PIL图片转cv2 图片
+        return img'''
+
+    def run(self):
+        faceCascade = cv2.CascadeClassifier('./haarcascades/haarcascade_frontalface_default.xml')
+
+        # 帧数、人脸ID初始化
+        frameCounter = 0
+        currentFaceID = 0
+
+        # 人脸跟踪器字典初始化
+        faceTrackers = {}
+
+        isTrainingDataLoaded = False
+        isDbConnected = False
+
+        self.detector = dlib.get_frontal_face_detector()
+        # dlib的68点模型，使用作者训练好的特征预测器
+        self.predictor = dlib.shape_predictor("./shape_predictor_68_face_landmarks.dat")
+
+
+
+
+
+
+        # construct the argument parse and parse the arguments
+        # 构造参数解析并解析参数
+        ap = argparse.ArgumentParser()
+        ap.add_argument("-p", "--shape-predictor", default="shape_predictor_68_face_landmarks.dat",
+                        help="path to facial landmark predictor")
+        ap.add_argument("-v", "--video", type=str, default="camera",
+                        help="path to input video file")
+        ap.add_argument("-t", "--threshold", type=float, default=0.27,
+                        help="threshold to determine closed eyes")
+        ap.add_argument("-f", "--frames", type=int, default=2,
+                        help="the number of consecutive frames the eye must be below the threshold")
+        args = vars(ap.parse_args())
+
+        # 初始化摇头帧计数器和摇头次数
+        distance_left = 0
+        distance_right = 0
+        TOTAL_FACE = 0
+        # 初始化点头帧计数器和点头次数
+
+        # 初始化dlib的人脸检测器（基于HOG），然后创建面部界标预测器
+        print("[Prepare000] 加载面部界标预测器...")
+        # 表示脸部位置检测器
+        # 表示脸部特征位置检测器
+        predictor = dlib.shape_predictor(args["shape_predictor"])
+
+        # 左右眼的索引
+        (lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+        (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+        # 嘴唇的索引
+        (mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+        # 鼻子的索引
+        (nStart, nEnd) = face_utils.FACIAL_LANDMARKS_IDXS["nose"]
+        # 下巴的索引
+        (jStart, jEnd) = face_utils.FACIAL_LANDMARKS_IDXS['jaw']
+
+        # start the video stream thread
+        # 启动视频流线程
+        print("[Prepare111] 启动视频流线程...")
+
+        totalface = 0
+
+        #建cv2摄像头对象，这里使用电脑自带摄像头，如果接了外部摄像头，则自动切换到外部摄像头
+        #self.cap = cv2.VideoCapture(self.VIDEO_STREAM)
+
+        try:
+            while self.isRunning:
+                try:
+                    if CoreUI.cap.isOpened():
+                        ret, frame = CoreUI.cap.read()
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        #fps = CoreUI.cap.get(cv2.CAP_PROP_FPS)
+                        #print(fps)
+                        # 是否执行直方图均衡化
+                        if self.isEqualizeHistEnabled:
+                            gray = cv2.equalizeHist(gray)
+                        faces = faceCascade.detectMultiScale(gray, 1.3, 5, minSize=(90, 90))
+
+                        # 预加载数据文件
+                        if not isTrainingDataLoaded and os.path.isfile(CoreUI.trainingData):
+                            recognizer = cv2.face.LBPHFaceRecognizer_create()
+                            recognizer.read(CoreUI.trainingData)
+                            isTrainingDataLoaded = True
+                        if not isDbConnected and os.path.isfile(CoreUI.database):
+                            conn = sqlite3.connect(CoreUI.database)
+                            cursor = conn.cursor()
+                            isDbConnected = True
+
+                        captureData = {}
+                        realTimeFrame = frame.copy()
+                        alarmSignal = {}
+
+                        # 人脸跟踪
+                        # Reference：https://github.com/gdiepen/face-recognition
+                        if self.isFaceTrackerEnabled:
+
+                            # 要删除的人脸跟踪器列表初始化
+                            fidsToDelete = []
+
+                            for fid in faceTrackers.keys():
+                                # 实时跟踪
+                                trackingQuality = faceTrackers[fid].update(realTimeFrame)
+                                # 如果跟踪质量过低，删除该人脸跟踪器
+                                if trackingQuality < 7:
+                                    fidsToDelete.append(fid)
+
+                            # 删除跟踪质量过低的人脸跟踪器
+                            for fid in fidsToDelete:
+                                faceTrackers.pop(fid, None)
+
+                            for (_x, _y, _w, _h) in faces:
+                                isKnown = False
+
+                                if self.isFaceRecognizerEnabled:
+                                    cv2.rectangle(realTimeFrame, (_x, _y), (_x + _w, _y + _h), (232, 138, 30), 2)
+
+
+
+                                    cv2.putText(realTimeFrame, "Nod: {}".format(self.hTOTAL), (450, 90),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                    cv2.putText(realTimeFrame, "Blinks: {}".format(self.TOTAL), (450, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                    cv2.putText(realTimeFrame, "Yawning: {}".format(self.mTOTAL), (450, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                    cv2.putText(realTimeFrame, "Face: {}".format(len(faces)), (300, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                    #cv2.putText(realTimeFrame, "No Face", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255),3, cv2.LINE_AA)
+                                    face_id, confidence = recognizer.predict(gray[_y:_y + _h, _x:_x + _w])
+                                    logging.debug('face_id：{}，confidence：{}'.format(face_id, confidence))
+
+                                    if self.isDebugMode:
+                                        CoreUI.logQueue.put('Debug -> face_id：{}，confidence：{}'.format(face_id, confidence))
+
+                                    # 从数据库中获取识别人脸的身份信息
+                                    try:
+                                        cursor.execute("SELECT * FROM users WHERE face_id=?", (face_id,))
+                                        result = cursor.fetchall()
+                                        if result:
+                                            en_name = result[0][3]
+                                        else:
+                                            raise Exception
+                                    except Exception as e:
+                                        logging.error('读取数据库异常，系统无法获取Face ID为{}的身份信息'.format(face_id))
+                                        CoreUI.logQueue.put('Error：读取数据库异常，系统无法获取Face ID为{}的身份信息'.format(face_id))
+                                        en_name = ''
+
+                                    # 若置信度评分小于置信度阈值，认为是可靠识别
+                                    if confidence < self.confidenceThreshold:
+                                        isKnown = True
+                                        cv2.putText(realTimeFrame, en_name, (_x - 5, _y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                                                    (0, 97, 255), 2)
+                                    else:
+                                        # 若置信度评分大于置信度阈值，该人脸可能是陌生人
+                                        cv2.putText(realTimeFrame, 'unknown', (_x - 5, _y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                                                    (0, 0, 255), 2)
+                                        # 若置信度评分超出自动报警阈值，触发报警信号
+                                        '''if confidence > self.autoAlarmThreshold:
+                                            # 检测报警系统是否开启
+                                            if self.isPanalarmEnabled:
+                                                alarmSignal['timestamp'] = datetime.now().strftime('%Y%m%d%H%M%S')
+                                                alarmSignal['img'] = realTimeFrame
+                                                CoreUI.alarmQueue.put(alarmSignal)
+                                                logging.info('系统发出了报警信号')'''
+
+                                # 帧数自增
+                                frameCounter += 1
+
+                                # 每读取10帧，检测跟踪器的人脸是否还在当前画面内
+                                if frameCounter % 10 == 0:
+                                    # 这里必须转换成int类型，因为OpenCV人脸检测返回的是numpy.int32类型，
+                                    # 而dlib人脸跟踪器要求的是int类型
+                                    x = int(_x)
+                                    y = int(_y)
+                                    w = int(_w)
+                                    h = int(_h)
+
+                                    # 计算中心点
+                                    x_bar = x + 0.5 * w
+                                    y_bar = y + 0.5 * h
+
+                                    # matchedFid表征当前检测到的人脸是否已被跟踪
+                                    matchedFid = None
+
+                                    for fid in faceTrackers.keys():
+                                        # 获取人脸跟踪器的位置
+                                        # tracked_position 是 dlib.drectangle 类型，用来表征图像的矩形区域，坐标是浮点数
+                                        tracked_position = faceTrackers[fid].get_position()
+                                        # 浮点数取整
+                                        t_x = int(tracked_position.left())
+                                        t_y = int(tracked_position.top())
+                                        t_w = int(tracked_position.width())
+                                        t_h = int(tracked_position.height())
+
+                                        # 计算人脸跟踪器的中心点
+                                        t_x_bar = t_x + 0.5 * t_w
+                                        t_y_bar = t_y + 0.5 * t_h
+
+                                        # 如果当前检测到的人脸中心点落在人脸跟踪器内，且人脸跟踪器的中心点也落在当前检测到的人脸内
+                                        # 说明当前人脸已被跟踪
+                                        if ((t_x <= x_bar <= (t_x + t_w)) and (t_y <= y_bar <= (t_y + t_h)) and
+                                                (x <= t_x_bar <= (x + w)) and (y <= t_y_bar <= (y + h))):
+                                            matchedFid = fid
+
+                                    # 如果当前检测到的人脸是陌生人脸且未被跟踪
+                                    if not isKnown and matchedFid is None:
+                                        # 创建一个人脸跟踪器
+                                        tracker = dlib.correlation_tracker()
+                                        # 锁定跟踪范围
+                                        tracker.start_track(realTimeFrame, dlib.rectangle(x - 5, y - 10, x + w + 5, y + h + 10))
+                                        # 将该人脸跟踪器分配给当前检测到的人脸
+                                        faceTrackers[currentFaceID] = tracker
+                                        # 人脸ID自增
+                                        currentFaceID += 1
+
+                            # 使用当前的人脸跟踪器，更新画面，输出跟踪结果
+                            for fid in faceTrackers.keys():
+                                tracked_position = faceTrackers[fid].get_position()
+
+                                t_x = int(tracked_position.left())
+                                t_y = int(tracked_position.top())
+                                t_w = int(tracked_position.width())
+                                t_h = int(tracked_position.height())
+
+                                # 在跟踪帧中圈出人脸
+                                #cv2.rectangle(realTimeFrame, (t_x, t_y), (t_x + t_w, t_y + t_h), (0, 0, 255), 2)
+                                cv2.putText(realTimeFrame, 'tracking...', (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255),
+                                            2)
+
+                                for start, end in self.line_pairs:
+                                    # print(reprojectdst[start], reprojectdst[end])
+                                    starts = reprojectdst[start]
+                                    ends = reprojectdst[end]
+                                    cv2.line(realTimeFrame, (int(starts[0]), int(starts[1])), (int(ends[0]), int(ends[1])), (0, 0, 255))
+                                #self.
+                                '''_translate = QtCore.QCoreApplication.translate
+                                self.label_8 = QtWidgets.QLabel()
+                                self.label_8.setGeometry(QtCore.QRect(220, 10, 111, 41))
+                                self.label_8.setStyleSheet("font: 16pt \"Agency FB\";")
+                                self.label_8.setObjectName("label_8")
+                                self.label_8.setText(_translate("CoreUI", "人脸数："))'''
+
+                                # 使用cv2.convexHull获得凸包位置，使用drawContours画出轮廓位置进行画图操作
+
+                                cv2.putText(realTimeFrame, "Nod: {}".format(self.hTOTAL), (450, 90),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                cv2.putText(realTimeFrame, "Blinks: {}".format(self.TOTAL), (450, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                cv2.putText(realTimeFrame, "Yawning: {}".format(self.mTOTAL), (450, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+                                cv2.putText(realTimeFrame, "Face: {}".format(len(faces)), (300, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                #cv2.putText(realTimeFrame, "No Face", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255),3, cv2.LINE_AA)
+                        captureData['originFrame'] = frame
+                        captureData['realTimeFrame'] = realTimeFrame
+                        CoreUI.captureQueue.put(captureData)
+
+
+
+
+                        #flag, im_rd = self.cap.read()
+                        # 取灰度
+                        #gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                        # 使用人脸检测器检测每一帧图像中的人脸。并返回人脸数faces
+                        faces = self.detector(gray, 0)
+
+
+
+
+
+
+
+                        if self.isFaceTrackerEnabled:
+                            if(len(faces)!=0):
+                                for k, d in enumerate(faces):
+                                        try:
+                                            #cv2.rectangle(realTimeFrame, (d.left(), d.top()), (d.right(), d.bottom()), (0, 255, 255),1)
+                                            # 使用预测器得到68点数据的坐标
+                                            shape = self.predictor(realTimeFrame, d)
+                                            #判断是否疲劳
+                                            if self.isFaceTrackerEnabled is True:
+                                                for i in range(68):
+                                                    cv2.circle(realTimeFrame, (shape.part(i).x, shape.part(i).y), 2, (0, 255, 0), -1, 8)
+                                            # 将脸部特征信息转换为数组array的格式
+                                            shape = face_utils.shape_to_np(shape)
+                                            """
+                                            打哈欠
+                                            """
+
+                                            # 嘴巴坐标
+                                            mouth = shape[mStart:mEnd]
+                                            # 打哈欠
+                                            mar = self.mouth_aspect_ratio(mouth)
+                                            # 使用cv2.convexHull获得凸包位置，使用drawContours画出轮廓位置进行画图操作
+                                            mouthHull = cv2.convexHull(mouth)
+                                            #cv2.drawContours(frame, [mouthHull], -1, (0, 255, 0), 1)
+                                            # 同理，判断是否打哈欠
+                                            if mar > self.MAR_THRESH:# 张嘴阈值0.5
+                                                    self.mCOUNTER += 1
+                                            else:
+                                                    # 如果连续3次都小于阈值，则表示打了一次哈欠
+                                                    if self.mCOUNTER >= self.MOUTH_AR_CONSEC_FRAMES:# 阈值：3
+                                                        self.mTOTAL += 1
+                                                        self.logQueue1.put('您已经打哈欠{}次'.format(self.mTOTAL))
+                                                        #显示
+                                                        #cv2.putText(im_rd, "Yawning!", (10, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                                        #self.m_textCtrl3.AppendText(time.strftime('%Y-%m-%d %H:%M ', time.localtime())+u"打哈欠\n")
+                                                    # 重置嘴帧计数器im_rd
+                                                    self.mCOUNTER = 0
+                                            #cv2.putText(im_rd, "COUNTER: {}".format(self.mCOUNTER), (150, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                            #cv2.putText(im_rd, "MAR: {:.2f}".format(mar), (300, 60),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+
+
+                                            """
+                                            眨眼
+                                            """
+                                            # 提取左眼和右眼坐标
+                                            leftEye = shape[lStart:lEnd]
+                                            rightEye = shape[rStart:rEnd]
+                                            # 构造函数计算左右眼的EAR值，使用平均值作为最终的EAR
+                                            leftEAR = self.eye_aspect_ratio(leftEye)
+                                            rightEAR = self.eye_aspect_ratio(rightEye)
+                                            ear = (leftEAR + rightEAR) / 2.0
+                                            leftEyeHull = cv2.convexHull(leftEye)
+                                            rightEyeHull = cv2.convexHull(rightEye)
+                                            # 使用cv2.convexHull获得凸包位置，使用drawContours画出轮廓位置进行画图操作
+                                            cv2.drawContours(realTimeFrame, [leftEyeHull], -1, (0, 255, 0), 1)
+                                            cv2.drawContours(realTimeFrame, [rightEyeHull], -1, (0, 255, 0), 1)
+                                            # 循环，满足条件的，眨眼次数+1
+                                            #if ear<0.2:
+                                                #print("疲劳疲劳疲疲劳闭眼睛")
+                                            #print("%.2f"%(ear))   #后台眨眼大小计数
+                                            end=time.time()
+                                            #if ear<0.15:
+                                                 #cv2.putText(im_rd, "CLOSE", (75, 250), cv2.FONT_HERSHEY_PLAIN, 7, (255, 0, 255)) #方法，作用：在图像上打印文字，设置字体，颜色，大小
+
+                                            #else:
+                                            if ear > 0.16:
+                                                #cv2.putText(im_rd, "OPEN", (75, 250), cv2.FONT_HERSHEY_PLAIN, 7, (0, 255, 0))
+
+                                                start1 = time.time() #记时
+                                            #print("%.5f"%end)
+                                                #print("闭眼时间:%.5f秒"%(end-start1))#获取睁闭眼时间差
+                                                #self.m_textCtrl3.AppendText(u"闭眼时间:%.2f秒"%(end-start1))
+                                            if (end-start1) > 1.5:
+                                                 cv2.putText(realTimeFrame, "TIRED", (200, 325), cv2.FONT_HERSHEY_PLAIN, 7, (0, 0, 255))
+                                                 #self.m_textCtrl3.AppendText(u"")
+                                                 self.logQueue1.put('您已有疲劳迹象(眼睛状态不好） 发出警告  \n')
+                                                 duration = 1000
+                                                 freq = 1000
+                                                 winsound.Beep(freq, duration)#调用喇叭，设置声音大小，与时间长短
+                                                 #self.TOTAL=-1
+
+                                                 self.TOTAL = -1
+                                                 self.mTOTAL = 0
+                                                 self.hTOTAL = 0
+
+                                            if ear < self.EYE_AR_THRESH:# 眼睛长宽比：0.3 正常人驾驶时ear在0.26-0.30之间  而疲劳驾驶时眼睛半睁半闭，大约在0.15-0.18左右   全闭时在0.11左右  为记录疲劳睁闭眼
+                                                self.COUNTER += 1
+                                            else:
+                                                # 如果连续3次都小于阈值，则表示进行了一次眨眼活动
+                                                if self.COUNTER >= self.EYE_AR_CONSEC_FRAMES:# 阈值：3
+                                                    self.TOTAL += 1
+                                                    #self.m_textCtrl3.AppendText(time.strftime('%Y-%m-%d %H:%M ', time.localtime())+u"眨眼\n")
+                                                    self.logQueue1.put('您已经疲劳眨眼{}次'.format(self.TOTAL))
+                                                # 重置眼帧计数器
+                                                self.COUNTER = 0
+                                                # 第十四步：进行画图操作，同时使用cv2.putText将眨眼次数进行显示
+
+                                            #cv2.putText(im_rd, "COUNTER: {}".format(self.COUNTER), (150, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                            #cv2.putText(im_rd, "EAR: {:.2f}".format(ear), (300, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+                                            """
+                                            瞌睡点头
+                                            """
+                                                # 获取头部姿态
+                                            try:
+                                                reprojectdst, euler_angle = self.get_head_pose(shape)
+                                                har = euler_angle[0, 0]# 取pitch旋转角度
+                                                #print('%.2f'%har)
+
+                                                end2=time.time()
+                                                #end2=time.time()
+                                                start2 = 0
+                                                if  har<13:  #最重要的是  一开始要抬头！！ 抬头！！  睁眼！  让条件呢个够满足从而进入程序判断
+                                                    #print("fatigue")
+                                                    start2=time.time()
+
+                                                    #print("在打瞌睡！")
+
+                                                    #print("%.5f%(end2-start2)")
+                                                    #print("%.5f"%start2)
+                                                    #print("%.5f"%end2)
+                                                if (end2-start2) > 1.5 :
+                                                    cv2.putText(realTimeFrame, "TIRED", (200, 325), cv2.FONT_HERSHEY_PLAIN, 7, (0, 0, 255))
+                                                    #self.m_textCtrl3.AppendText(u"")
+                                                    #self.logQueue.put('您已有疲劳迹象(有低头不起的迹象) 发出警告  请停车休息!!!\n')
+
+                                                    self.logQueue1.put('您已有疲劳迹象(有低头不起的迹象) 发出警告  \n')
+                                                    duration = 1000
+                                                    freq = 1000
+                                                    winsound.Beep(freq, duration)#调用喇叭，设置声音大小，与时间长短
+
+                                                    self.TOTAL = 0
+                                                    self.mTOTAL = 0
+                                                    self.hTOTAL = -1
+
+                                                    #print('---------------------------')
+                                                        #print("时间:%.5f秒"%(start2-end2))#获取睁闭眼时间差
+                                                    #print(end)
+                                                    #print(start1)
+                                                    #print(end-start1)
+                                            except Exception as e:
+                                                print(e)
+                                            if har > self.HAR_THRESH:# 点头阈值4
+                                                self.hCOUNTER += 1
+                                            else:
+                                                # 如果连续3次都小于阈值，则表示瞌睡点头一次
+                                                if self.hCOUNTER >= self.NOD_AR_CONSEC_FRAMES:# 阈值：3
+                                                    self.hTOTAL += 1
+                                                    #self.m_textCtrl3.AppendText(time.strftime('%Y-%m-%d %H:%M ', time.localtime())+u"瞌睡点头\n")
+                                                    self.logQueue1.put('您已经瞌睡点头{}次'.format(self.hTOTAL))
+                                                # 重置点头帧计数器
+                                                self.hCOUNTER = 0
+                                            # 绘制正方体12轴(视频流尺寸过大时，reprojectdst会超出int范围，建议压缩检测视频尺寸)
+
+
+
+
+                                            # 显示角度结果
+                                            #cv2.putText(im_rd, "X: " + "{:7.2f}".format(euler_angle[0, 0]), (10, 90), cv2.FONT_HERSHEY_SIMPLEX,0.75, (0, 255, 0), thickness=2)# GREEN
+                                            #cv2.putText(im_rd, "Y: " + "{:7.2f}".format(euler_angle[1, 0]), (150, 90), cv2.FONT_HERSHEY_SIMPLEX,0.75, (255, 0, 0), thickness=2)# BLUE
+                                            #cv2.putText(im_rd, "Z: " + "{:7.2f}".format(euler_angle[2, 0]), (300, 90), cv2.FONT_HERSHEY_SIMPLEX,0.75, (0, 0, 255), thickness=2)# RED
+
+
+
+
+
+
+
+
+
+
+                                            # grab the frame from the threaded video file stream, resize
+                                            # it, and convert it to grayscale
+                                            # channels)
+
+                                            """
+                                            摇头
+                                            """
+                                            # determine the facial landmarks for the face region, then
+                                            # convert the facial landmark (x, y)-coordinates to a NumPy
+                                            # array
+                                            shape = self.predictor(realTimeFrame, d)
+                                            shape = face_utils.shape_to_np(shape)
+
+                                            nose = shape[nStart:nEnd]
+                                            jaw = shape[jStart:jEnd]
+                                            NOSE_JAW_Distance = self.nose_jaw_distance(nose, jaw)
+                                            # 移植鼻子到左右脸边界的欧式距离
+                                            face_left1 = NOSE_JAW_Distance[0]
+                                            face_right1 = NOSE_JAW_Distance[1]
+                                            face_left2 = NOSE_JAW_Distance[2]
+                                            face_right2 = NOSE_JAW_Distance[3]
+
+
+                                            # 根据鼻子到左右脸边界的欧式距离，判断是否摇头
+                                            # 左脸大于右脸
+
+                                            if face_left1 >= face_right1 + 50 and face_left2 >= face_right2 + 50:
+                                                distance_left += 1
+                                            # 右脸大于左脸
+                                            if face_right1 >= face_left1 + 50 and face_right2 >= face_left2 + 50:
+                                                distance_right += 1
+                                            # 左脸大于右脸，并且右脸大于左脸，判定摇头
+                                            if distance_left != 0 and distance_right != 0:
+                                                TOTAL_FACE += 1
+                                                distance_right = 0
+                                                distance_left = 0
+
+                                            if TOTAL_FACE != totalface:
+                                                self.logQueue1.put('您已经摇头{}次'.format(TOTAL_FACE))
+                                                totalface += 1
+
+
+                                        except Exception as e:
+                                            print(e)
+                                            continue
+
+
+                                    #print('嘴巴实时长宽比:{:.2f} '.format(mar)+"\t是否张嘴："+str([False,True][mar > self.MAR_THRESH]))
+                                    #print('眼睛实时长宽比:{:.2f} '.format(ear)+"\t是否眨眼："+str([False,True][self.COUNTER>=1]))
+
+                            '''else:
+                                # 没有检测到人脸
+                                self.oCOUNTER+=1
+                                cv2.putText(realTimeFrame, "No Face", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 2)
+                                self.logQueue1.put('摄像头未捕获到人脸！\n')'''
+                                #cv2.putText(realTimeFrame, "face: {}".format(len(faces)), (300, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                           # 0.7, (0, 0, 255), 2)
+                            if self.oCOUNTER >= self.OUT_AR_CONSEC_FRAMES_check:
+                                #self.m_textCtrl3.AppendText(time.strftime('%Y-%m-%d %H:%M ', time.localtime())+u"未检测到人脸!!!\n")
+                                self.oCOUNTER = 0
+
+                            if self.TOTAL >= 20 or self.mTOTAL>=15 or self.hTOTAL>=10:
+                                #flag, frame1 = CoreUI.cap.read()
+                            #  取灰度
+                                #img_gray = cv2.cvtColor(realTimeFrame, cv2.COLOR_RGB2GRAY)
+                                #self.m_textCtrl3.AppendText(u"您已有疲劳迹象 发出警告  请停车休息!!!\n")
+                                cv2.imwrite("E:/new/%d.jpg"%(self.i), frame)   #将满足当前帧报警的摄像头捕捉到的图片保存到本地文件夹内并以jpg格式保存
+                                #cv2.imencode('.jpg', frame)[1].tofile('E:/new/李治江-{}.jpg'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+                                #cv2.imwrite("E:/1.jpg",frame)
+                                #cv2.imencode('.jpg', img)[1].tofile("含有中文路径/xxx.jpg")
+                                img = cv2.imread("./new/%d.jpg"%(self.i))       #读取图片
+                                path = "./haarcascades/haarcascade_frontalface_alt.xml"          #人脸探测器xml文件路径
+                                hc = cv2.CascadeClassifier(path)
+                                faces = hc.detectMultiScale(img)
+
+                                for face in faces:      #用人脸探测器裁剪图片中的人脸并以(128,128)尺寸大小保存到文件夹
+                                   imgROI = img[face[1]:face[1] + face[3], face[0]:face[0] + face[2]]
+                                   imgROI = cv2.resize(imgROI, (128, 128), interpolation=cv2.INTER_AREA)
+                                   #self.m_textCtrl3.AppendText(u"保存本帧图片并切割出人脸\n")
+                                   #self.m_textCtrl3.AppendText(u"\n")
+                                   self.logQueue1.put('已成功保存本帧照片并使用改进的YOLOv3网络模型进行判断！')
+                                   cv2.imwrite("./new/%d.jpg"%(self.i), imgROI)
+                                   #print("The {}th image finished".format(self.i))    #提示第几张图片已经完成人脸裁剪
+
+                                #img = image.load_img('E:/new/%d.jpg'%(self.i), target_size=(128, 128))
+                                img = image.load_img("./new/%d.jpg"%(self.i), target_size=(128, 128))
+                                x = image.img_to_array(img)     #将jpg格式图片进行降维处理成数组形式，与之后的神经网络输入图片要求匹配
+                                x = np.expand_dims(x, axis=0)
+                                y=my_model.predict(x)           #调用模型进行预测图片结果
+                                if (y[0][0]) > 0.5:             #0.5为阈值，若大于0.5则判断为疲劳，反之则为不疲劳      这里卡 得把阈值反过来
+                                   #self.m_textCtrl3.AppendText(u"")
+
+                                   '''duration = 1500
+                                   freq = 1000
+                                   winsound.Beep(freq, duration)#调用喇叭，设置声音大小，与时间长短'''
+                                   threading.Thread(target=lambda: winsound.Beep(1000, 1000)).start()
+                                   cv2.putText(realTimeFrame, "SLEEPING!", (100, 100),cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 2)
+
+                                   print('tired tired tired tired tired tired tired tired tired tired tired tired tired tired!')
+                                   self.logQueue1.put('判断结果为疲惫！！请寻找就近的停车点进行休息！\n')
+                                   self.i=self.i+1
+                                   print('%d'%(self.i))
+                                  #else:
+                                      #print('no fatigue no fatigu eno fatigu eno fatigue no fatigue no fatigue no fatigue!')
+                                     #if mar>self.MAR_THRESH or self.mCOUNTER>=1:#报警后，人眼正常睁开或者没有打哈欠了，则重新计数，继续检测
+
+                                   self.TOTAL=0
+                                   self.mTOTAL=0
+                                   self.hTOTAL=0
+                                      # continue
+                                continue
+                        else:
+                            continue
+                except Exception as e:
+                    print(e)
+        except Exception as e:
+            print(e)
+        print("end")
+        # 停止OpenCV线程
+
+    def stop(self):
+        self.isRunning = False
+        self.quit()
+        self.wait()
+
+if __name__ == '__main__':
+    logging.config.fileConfig('./config/logging.cfg')
+    app = QApplication(sys.argv)
+    window = CoreUI()
+    window.show()
+    sys.exit(app.exec())

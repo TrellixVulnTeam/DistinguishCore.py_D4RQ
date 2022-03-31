@@ -1,0 +1,164 @@
+/*title background*/
+QWidget#widget1{
+    background: rgb(209, 124, 169);
+    border-radius: 10px;
+}
+
+/*max full min help pushbutton*/
+QPushButton#pushButton_4,
+QPushButton#pushButton_full,
+QPushButton#pushButton_min,
+QPushButton#pushButton_3{
+    border: none;    
+    background: none;
+}
+
+QPushButton#pushButton_11,
+QPushButton#startFaceRecordButton,
+QPushButton#initDbButtonRecord,
+QPushButton#initDbButton,
+QPushButton#initDbButtonManage,
+QPushButton#enableFaceRecordButton,
+QPushButton#addOrUpdateUserInfoButton,
+QPushButton#migrateToDbButton{
+    border: none;
+    color: white;
+    background: rgb( 44, 128, 245 );
+    border-radius: 6px;
+}
+
+QPushButton#startWebcamButton{
+    border: none;
+    border-radius: 30px;
+    background: rgb( 44, 128, 245 );
+    image: url(camera.png);
+    padding: 15px;
+}
+
+QPushButton#pushButton,
+QPushButton#pushButton2,
+QPushButton#pushButton_2{
+background-color:transparent;
+font-size:20px;
+color:black;
+font-weight:bold;
+border-radius: 10px;
+}
+QPushButton#pushButton:checked,
+QPushButton#pushButton_2:checked,
+QPushButton#pushButton2:checked,
+QPushButton#pushButton:hover,
+QPushButton#pushButton2:hover,
+QPushButton#pushButton_2:hover{
+    background-color:white;
+}
+
+QGroupBox#functionGroupBox,
+QGroupBox#logGroupBox,
+QGroupBox#dbGroupBox,
+QGroupBox#faceRecordGroupBox,
+QGroupBox#trainGroupBox,
+QGroupBox#queryUserGroupBox,
+QGroupBox#infoConfirmGroupBox,
+QGroupBox#realTimeCaptureGroupBox{
+    background: rgb(246, 245, 248);
+    border-radius: 10px;
+}
+
+QWidget#widgetCamera{
+    background: rgb(199, 199, 199);
+    border-radius: 10px;
+}
+
+QGroupBox#dbStatusGroupBox{
+    background: rgba(245, 245, 247, 128 );
+    border-radius: 10px;
+}
+
+QGroupBox#groupBox_qrzl_1,
+QGroupBox#groupBox_qrzl_2,
+QGroupBox#groupBox_qrzl_3{
+    background: #e3e3e3;
+    border-radius: 4px;
+}
+
+QPushButton#migrateToDbButton,
+QPushButton#trainButton,
+QPushButton#deleteUserButton,
+QPushButton#queryUserButton{
+    border-radius: 15px;
+    background: rgb( 44, 129, 246 );
+}
+
+QLabel#realTimeCaptureLabel{
+    background: rgb( 238, 237, 242 );
+    border-radius: 4px;
+}
+
+QTextBrowser#logTextEdit{
+    background: rgb(235, 233, 233);
+    border-radius: 4px;
+    color: black;
+}
+
+QSlider::groove:horizontal {
+    height: 10px; 
+    border-radius: 5px;
+    background: rgb(44, 128, 246);
+}
+QSlider::handle:horizontal {
+    background: blue;
+    width: 18px;
+    height: 18px;
+    margin: -4px 0; 
+    border-radius: 9px;
+}
+QSlider::add-page:horizontal {
+    background: gray;
+    border-radius: 5px;
+}
+QSlider::sub-page:horizontal {
+    background: rgb(44, 128, 246);
+    border-radius: 5px;
+}
+
+QLCDNumber#faceRecordCountLcdNum{
+    background: rgb(223, 225, 229);
+    border-radius: 5px;
+}
+
+QLCDNumber#dbUserCountLcdNum{
+    color: rgb( 41, 129, 253 );
+}
+
+QGroupBox#dbVisualGroupBox{
+    border-radius: 10px;
+    border: 1px solid lightgray;
+    background: white;
+}
+
+QTableWidget#tableWidget{
+    background: transparent;
+    border: none;
+    color: black;
+    border-radius: 10px;
+}
+
+QTableWidget#tableWidget::item{
+    border: none;
+    border: 0px solid transparent;
+}
+
+QHeaderView::section {
+    background-color:  rgb( 254, 254, 254 );
+    color:  rgb( 43, 130, 246 );
+    padding-left: 4px;
+    border: 0px solid #999999;
+   height: 30px;
+   border-bottom-width: 1px ;
+}
+
+QLineEdit#queryUserLineEdit{
+    border-radius: 5px;
+    background: #e3e3e3;
+}
