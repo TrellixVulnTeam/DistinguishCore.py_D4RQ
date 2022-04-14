@@ -511,8 +511,6 @@ class UserDistinguishProgramThread(QThread):
                 realTimeFrame = self.blink(leftEye, rightEye, realTimeFrame)
 
                 """摇头"""
-                shape = self.predictor(realTimeFrame, d)
-                shape = face_utils.shape_to_np(shape)
                 nose = shape[nStart:nEnd]
                 jaw = shape[jStart:jEnd]
                 distance_left, distance_right, totalface = self.shakeHead(nose, jaw, distance_left, distance_right,
